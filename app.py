@@ -26,7 +26,7 @@ CANDIDATE_ROUTE_JSON_PATHS = [
     os.path.join(BASE_DIR, "results_cls_no_delayrate_fast_simple", "route_constraints.json"),
     os.path.join(BASE_DIR, "route_constraints.json"),
 ]
-INDEX_HTML = os.path.join(BASE_DIR, "index.html")  # 可选：如果你想让 Render 同时托管前端
+INDEX_HTML = os.path.join(BASE_DIR, "index.html")  # 可选：托管前端
 
 def pick_first_exist(paths, name):
     for p in paths:
@@ -63,7 +63,7 @@ def build_all_from_constraints(constraints: dict):
     airports = set()
     routes = set()
 
-    for air, from_dict in constraints.items():
+    for air, from_dict in (constraints or {}).items():
         for frm, tos in (from_dict or {}).items():
             airports.add(str(frm))
             for t in tos or []:
@@ -77,6 +77,30 @@ def build_all_from_constraints(constraints: dict):
     }
 
 ALL_LISTS = build_all_from_constraints(route_constraints)
+
+# ====== ✅ 自动判断：bin 列在训练时是 numeric 还是 string ======
+def infer_bin_mode_from_model(col_name: str) -> str:
+    """
+    返回 "numeric" 或 "string"（fallback 为 string）
+    原理：从 fitted ColumnTransformer(transformers_) 中找这列属于 num 还是 cat
+    """
+    try:
+        if hasattr(model, "named_steps") and "prep" in model.named_steps:
+            prep = model.named_steps["prep"]
+            if hasattr(prep, "transformers_"):
+                for name, _trans, cols in prep.transformers_:
+                    # cols 在 fitted 后通常会变成 list[str]
+                    if isinstance(cols, list) and col_name in cols:
+                        if name == "num":
+                            return "numeric"
+                        if name == "cat":
+                            return "string"
+    except Exception:
+        pass
+    return "string"
+
+DEP_BIN_MODE = infer_bin_mode_from_model(DEP_BIN_COL)
+ARR_BIN_MODE = infer_bin_mode_from_model(ARR_BIN_COL)
 
 # ====== 折扣：更细（8档） ======
 def discount_suggestion(p: float):
@@ -107,17 +131,12 @@ def label_to_code(label: str) -> int:
 def code_to_label(code: int) -> str:
     return {0:"上午", 1:"下午", 2:"晚上"}.get(int(code), "未知")
 
-# 训练时 dep/arr bin 可能是数字(0/1/2)也可能是中文字符串
-# 没有 Excel 时没法 100% 自动判断，所以：默认按 string 传（更常见）
-DEP_BIN_MODE = "string"
-ARR_BIN_MODE = "string"
-
 def encode_bin_from_label(label: str, mode: str):
     code = label_to_code(label)
     if mode == "numeric":
-        return int(code)
+        return int(code)           # 0/1/2
     if mode == "string":
-        return code_to_label(code)
+        return code_to_label(code) # 上午/下午/晚上
     return None
 
 # ====== 输入 ======
@@ -132,21 +151,30 @@ class PredictIn(BaseModel):
 
 @app.get("/")
 def home():
-    # 如果你把 index.html 放在仓库根目录，就可以直接用 Render 的一个 URL 同时跑前后端
+    # 可选：Render 同时托管前端
     if os.path.exists(INDEX_HTML):
         return FileResponse(INDEX_HTML)
     return {"status": "ok", "message": "API is running. Go to /docs for testing."}
 
+# ✅ 关键：为了兼容你现有前端，/options 必须“只返回 constraints 映射”
 @app.get("/options")
 def options():
+    return route_constraints
+
+# 如果你需要 all 列表，用 /meta 取
+@app.get("/meta")
+def meta():
     return {
-        "constraints": route_constraints,
         "all": ALL_LISTS,
         "timebin_mode": {
             "dep_col": DEP_BIN_COL,
             "dep_mode": DEP_BIN_MODE,
             "arr_col": ARR_BIN_COL,
             "arr_mode": ARR_BIN_MODE
+        },
+        "model_files": {
+            "model_path_used": MODEL_PATH,
+            "route_json_used": ROUTE_JSON
         }
     }
 
@@ -156,25 +184,23 @@ def debug_expected():
     return {
         "expected_columns": cols,
         "has_feature_names_in": bool(cols),
+        "dep_bin_mode": DEP_BIN_MODE,
+        "arr_bin_mode": ARR_BIN_MODE,
         "model_path_used": MODEL_PATH,
         "route_json_used": ROUTE_JSON
     }
 
 @app.post("/predict")
 def predict(x: PredictIn):
-    # 组装 row（基础列）
     row = {
         "Airline": str(x.Airline),
         "AirportFrom": str(x.AirportFrom),
         "AirportTo": str(x.AirportTo),
         "DayOfWeek": int(x.DayOfWeek),
         "Length": float(x.Length),
+        ARR_TIME_COL: np.nan,  # 模型若不需要不会用到；需要也不会报错
     }
 
-    # 如果训练里有 ARR_TIME_COL 但你现在没用到，就给 NaN
-    row[ARR_TIME_COL] = np.nan
-
-    # 按训练时类型编码（这里默认 string）
     dep_bin_val = encode_bin_from_label(x.DepBin, DEP_BIN_MODE)
     arr_bin_val = encode_bin_from_label(x.ArrBin, ARR_BIN_MODE)
     row[DEP_BIN_COL] = dep_bin_val
@@ -182,7 +208,7 @@ def predict(x: PredictIn):
 
     df = pd.DataFrame([row])
 
-    # 对齐到模型训练时输入列：缺的补 np.nan，多的删
+    # 对齐到训练列：缺的补 np.nan，多的删
     expected = list(model.feature_names_in_) if hasattr(model, "feature_names_in_") else None
     if expected:
         for c in expected:
@@ -196,7 +222,6 @@ def predict(x: PredictIn):
         raise HTTPException(status_code=500, detail=f"Model inference failed: {repr(e)}")
 
     level, disc = discount_suggestion(p)
-
     return {
         "delay_probability": p,
         "delay_probability_percent": round(p * 100, 2),
@@ -204,4 +229,6 @@ def predict(x: PredictIn):
         "discount_percent": disc,
         "dep_bin_value_sent": dep_bin_val,
         "arr_bin_value_sent": arr_bin_val,
+        "dep_bin_mode_used": DEP_BIN_MODE,
+        "arr_bin_mode_used": ARR_BIN_MODE,
     }
